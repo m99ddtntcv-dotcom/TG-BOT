@@ -108,23 +108,54 @@ def get_missing_dependencies() -> list[str]:
     return missing
 
 
+def get_first_env(*keys: str) -> tuple[str, str | None]:
+    for key in keys:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value, key
+
+    return "", None
+
+
 def load_settings() -> Settings:
     load_env_file(BASE_DIR / ".env")
 
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    telegram_token, telegram_token_key = get_first_env(
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_TOKEN",
+        "BOT_TOKEN",
+        "TOKEN",
+    )
+    openai_api_key, openai_api_key_name = get_first_env(
+        "OPENAI_API_KEY",
+        "OPENAI_KEY",
+    )
     admin_chat_id_raw = os.getenv("ADMIN_CHAT_ID", "").strip()
 
     if not telegram_token:
         raise RuntimeError(
-            "Не задан TELEGRAM_BOT_TOKEN. Добавьте его в переменные окружения "
-            "или в файл .env рядом с main.py."
+            "Не задан токен Telegram. Ожидается переменная окружения "
+            "`TELEGRAM_BOT_TOKEN` (поддерживаются также `TELEGRAM_TOKEN`, "
+            "`BOT_TOKEN`, `TOKEN`). На Render добавьте её в Service -> Environment "
+            "и выполните redeploy."
         )
 
     if not openai_api_key:
         raise RuntimeError(
-            "Не задан OPENAI_API_KEY. Добавьте его в переменные окружения "
-            "или в файл .env рядом с main.py."
+            "Не задан `OPENAI_API_KEY` (поддерживается также `OPENAI_KEY`). "
+            "Добавьте его в переменные окружения Render или в файл .env рядом с main.py."
+        )
+
+    if telegram_token_key and telegram_token_key != "TELEGRAM_BOT_TOKEN":
+        LOGGER.warning(
+            "Используется %s для токена Telegram. Предпочтительное имя переменной: TELEGRAM_BOT_TOKEN",
+            telegram_token_key,
+        )
+
+    if openai_api_key_name and openai_api_key_name != "OPENAI_API_KEY":
+        LOGGER.warning(
+            "Используется %s для ключа OpenAI. Предпочтительное имя переменной: OPENAI_API_KEY",
+            openai_api_key_name,
         )
 
     admin_chat_id: int | None = None
