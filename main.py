@@ -1,27 +1,18 @@
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import re
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.request import urlopen
 from xml.sax.saxutils import escape
 
 try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
-try:
-    from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+    from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
     from telegram.ext import (
         ApplicationBuilder,
         CommandHandler,
-        ContextTypes,
         ConversationHandler,
         MessageHandler,
         filters,
@@ -29,12 +20,10 @@ try:
 except ImportError:
     ApplicationBuilder = None
     CommandHandler = None
-    ContextTypes = None
     ConversationHandler = None
     MessageHandler = None
     ReplyKeyboardMarkup = None
     ReplyKeyboardRemove = None
-    Update = None
     filters = None
 
 try:
@@ -44,7 +33,7 @@ try:
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 except ImportError:
     TA_CENTER = None
     A4 = None
@@ -53,7 +42,6 @@ except ImportError:
     mm = None
     pdfmetrics = None
     TTFont = None
-    Image = None
     Paragraph = None
     SimpleDocTemplate = None
     Spacer = None
@@ -66,10 +54,30 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-CHOICE, AREA, FLOORS, COMPLEXITY, PACKAGE, CONTACT = range(6)
+(
+    CHOICE,
+    AREA,
+    FLOORS,
+    COMPLEXITY,
+    PACKAGE,
+    BEDROOMS,
+    BATHROOMS,
+    KITCHEN_LIVING,
+    CABINET,
+    WARDROBE,
+    UTILITY,
+    GUEST_ROOM,
+    TERRACE,
+    GARAGE,
+    SAUNA,
+    MASTER_BEDROOM,
+    EXTRA_ROOMS,
+    CONTACT,
+) = range(18)
 
 START_KEYBOARD = [["🏠 Рассчитать дом"]]
 PACKAGE_KEYBOARD = [["🟢 Эскиз", "🔵 Проект"], ["🟡 Премиум"]]
+YES_NO_KEYBOARD = [["Да", "Нет"]]
 DESIGN_PRICE_PER_M2_RUB = 2000
 COMPLEXITY_MULTIPLIERS = {
     "простой": 1.0,
@@ -81,10 +89,7 @@ COMPLEXITY_MULTIPLIERS = {
 @dataclass(slots=True)
 class Settings:
     telegram_token: str
-    openai_api_key: str
     admin_chat_id: int | None
-    openai_text_model: str = "gpt-4.1-mini"
-    openai_image_model: str = "gpt-image-1"
 
 
 def load_env_file(path: Path) -> None:
@@ -103,8 +108,6 @@ def load_env_file(path: Path) -> None:
 def get_missing_dependencies() -> list[str]:
     missing: list[str] = []
 
-    if OpenAI is None:
-        missing.append("openai")
     if ApplicationBuilder is None:
         missing.append("python-telegram-bot")
     if SimpleDocTemplate is None:
@@ -117,18 +120,11 @@ def load_settings() -> Settings:
     load_env_file(BASE_DIR / ".env")
 
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     admin_chat_id_raw = os.getenv("ADMIN_CHAT_ID", "").strip()
 
     if not telegram_token:
         raise RuntimeError(
             "Не задан TELEGRAM_BOT_TOKEN. Добавьте его в переменные окружения "
-            "или в файл .env рядом с main.py."
-        )
-
-    if not openai_api_key:
-        raise RuntimeError(
-            "Не задан OPENAI_API_KEY. Добавьте его в переменные окружения "
             "или в файл .env рядом с main.py."
         )
 
@@ -141,10 +137,7 @@ def load_settings() -> Settings:
 
     return Settings(
         telegram_token=telegram_token,
-        openai_api_key=openai_api_key,
         admin_chat_id=admin_chat_id,
-        openai_text_model=os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini",
-        openai_image_model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1",
     )
 
 
@@ -187,6 +180,10 @@ def format_rubles(value: int | float) -> str:
     return f"{int(value):,}".replace(",", " ") + " ₽"
 
 
+def format_yes_no(value: bool) -> str:
+    return "Да" if value else "Нет"
+
+
 def parse_area(text: str) -> float:
     match = re.search(r"\d+(?:[.,]\d+)?", text)
     if not match:
@@ -199,16 +196,33 @@ def parse_area(text: str) -> float:
     return value
 
 
-def parse_floors(text: str) -> int:
+def parse_integer_value(text: str, label: str, minimum: int = 0, maximum: int = 20) -> int:
     match = re.search(r"\d+", text)
     if not match:
-        raise ValueError("Введите количество этажей числом, например `1` или `2`.")
+        raise ValueError(f"Введите {label} числом.")
 
     value = int(match.group(0))
-    if value < 1 or value > 10:
-        raise ValueError("Количество этажей должно быть в диапазоне от 1 до 10.")
+    if value < minimum or value > maximum:
+        raise ValueError(f"{label.capitalize()} должно быть в диапазоне от {minimum} до {maximum}.")
 
     return value
+
+
+def parse_floors(text: str) -> int:
+    return parse_integer_value(text, "количество этажей", minimum=1, maximum=10)
+
+
+def parse_yes_no(text: str) -> bool:
+    cleaned = text.strip().lower()
+    yes_values = ("да", "нуж", "yes", "y", "1")
+    no_values = ("нет", "не", "no", "n", "0")
+
+    if cleaned.startswith(yes_values):
+        return True
+    if cleaned.startswith(no_values):
+        return False
+
+    raise ValueError("Ответьте `Да` или `Нет`.")
 
 
 def normalize_complexity(text: str) -> str:
@@ -235,80 +249,46 @@ def calculate_price(area: float, floors: int, complexity: str) -> int:
     return round(area * DESIGN_PRICE_PER_M2_RUB * floor_multiplier * complexity_multiplier)
 
 
-def build_plan_prompt(area: float, floors: int, complexity: str) -> str:
+def normalize_extra_rooms(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return "Нет дополнительных помещений."
+
+    lowered = cleaned.lower()
+    if lowered in {"нет", "не нужны", "не нужно", "-", "без дополнительных помещений"}:
+        return "Нет дополнительных помещений."
+
+    return cleaned
+
+
+def build_rooms_summary(rooms: dict[str, Any]) -> str:
     return (
-        "Составь компактное архитектурное предложение для клиента.\n"
-        f"Площадь дома: {area:.1f} м2.\n"
-        f"Этажность: {floors}.\n"
-        f"Сложность проекта: {complexity}.\n"
-        "Нужен ответ на русском языке с разделами:\n"
-        "1. Общая концепция\n"
-        "2. Пример зонирования по этажам\n"
-        "3. Конструктивные рекомендации\n"
-        "4. На что обратить внимание при проектировании\n"
-        "Пиши по делу, без лишнего маркетинга."
+        "Состав помещений:\n"
+        f"- Спальни: {rooms['bedrooms']}\n"
+        f"- Санузлы: {rooms['bathrooms']}\n"
+        f"- Кухня-гостиная: {format_yes_no(rooms['kitchen_living'])}\n"
+        f"- Кабинет: {format_yes_no(rooms['cabinet'])}\n"
+        f"- Гардеробная: {format_yes_no(rooms['wardrobe'])}\n"
+        f"- Котельная / постирочная: {format_yes_no(rooms['utility'])}\n"
+        f"- Гостевая спальня: {format_yes_no(rooms['guest_room'])}\n"
+        f"- Терраса: {format_yes_no(rooms['terrace'])}\n"
+        f"- Гараж: {format_yes_no(rooms['garage'])}\n"
+        f"- Сауна: {format_yes_no(rooms['sauna'])}\n"
+        f"- Мастер-спальня: {format_yes_no(rooms['master_bedroom'])}\n"
+        f"- Дополнительно: {rooms['extra_rooms']}"
     )
 
 
-def generate_plan_text(client: Any, settings: Settings, area: float, floors: int, complexity: str) -> str:
-    prompt = build_plan_prompt(area, floors, complexity)
-
-    if hasattr(client, "responses"):
-        try:
-            response = client.responses.create(
-                model=settings.openai_text_model,
-                input=prompt,
-            )
-            output_text = getattr(response, "output_text", "").strip()
-            if output_text:
-                return output_text
-        except Exception:
-            LOGGER.exception("Responses API не сработал, пробую chat.completions.")
-
-    completion = client.chat.completions.create(
-        model=settings.openai_text_model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты архитектор-концептуалист. Пиши на русском языке коротко, "
-                    "структурно и практически полезно."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return (completion.choices[0].message.content or "").strip()
-
-
-def generate_plan_image(client: Any, settings: Settings, area: float, floors: int) -> bytes:
-    image_response = client.images.generate(
-        model=settings.openai_image_model,
-        prompt=(
-            "Architectural floor plan blueprint, clean black and white drawing, "
-            f"{area:.1f} square meter house, {floors} floors, technical presentation sheet"
-        ),
-        size="1024x1024",
+def build_brief_summary(data: dict[str, Any]) -> str:
+    return (
+        f"Пакет: {data['package']}\n"
+        f"Стоимость: {format_rubles(data['final_price'])} ({format_rubles(data['package_price_per_m2'])}/м²)\n"
+        f"Срок: {data['timeline']}\n\n"
+        f"{data['rooms_summary']}"
     )
 
-    if not getattr(image_response, "data", None):
-        raise RuntimeError("OpenAI не вернул изображение.")
 
-    image_item = image_response.data[0]
-
-    image_b64 = getattr(image_item, "b64_json", None)
-    if image_b64:
-        return base64.b64decode(image_b64)
-
-    image_url = getattr(image_item, "url", None)
-    if image_url:
-        with urlopen(image_url, timeout=30) as response:
-            return response.read()
-
-    raise RuntimeError("Не удалось получить данные изображения от OpenAI.")
-
-
-def create_pdf(data: dict[str, Any], image_bytes: bytes | None, filename: Path) -> None:
+def create_pdf(data: dict[str, Any], filename: Path) -> None:
     font_name = find_pdf_font()
     doc = SimpleDocTemplate(
         str(filename),
@@ -338,7 +318,7 @@ def create_pdf(data: dict[str, Any], image_bytes: bytes | None, filename: Path) 
     )
 
     story = [
-        Paragraph("Архитектурное предложение", title_style),
+        Paragraph("Анкета на проектирование", title_style),
         Spacer(1, 8),
         Paragraph(f"Площадь: {paragraph_text(data['area'])} м2", body_style),
         Paragraph(f"Этажи: {paragraph_text(data['floors'])}", body_style),
@@ -348,77 +328,35 @@ def create_pdf(data: dict[str, Any], image_bytes: bytes | None, filename: Path) 
             body_style,
         ),
         Spacer(1, 8),
-        Paragraph("Концепция планировки", title_style),
-        Paragraph(paragraph_text(data["plan_text"]), body_style),
-    ]
-
-    if image_bytes:
-        image_stream = BytesIO(image_bytes)
-        image_stream.seek(0)
-        story.extend(
-            [
-                Spacer(1, 8),
-                Image(image_stream, width=160 * mm, height=100 * mm),
-            ]
-        )
-
-    if data.get("price") is not None:
-        story.extend(
-            [
-                Spacer(1, 12),
-                Paragraph(
-                    f"Полная стоимость проектирования: {paragraph_text(format_rubles(data['price']))}",
-                    title_style,
-                ),
-                Paragraph(
-                    f"Ставка проектирования: {paragraph_text(format_rubles(data['price_per_m2']))}/м²",
-                    body_style,
-                ),
-            ]
-        )
-
-    if data.get("final_price") is not None:
-        story.extend(
-            [
-                Spacer(1, 8),
-                Paragraph(
-                    f"Стоимость пакета {paragraph_text(data['package'])}: "
-                    f"{paragraph_text(format_rubles(data['final_price']))}",
-                    title_style,
-                ),
-                Paragraph(
-                    f"Ставка пакета: {paragraph_text(format_rubles(data['package_price_per_m2']))}/м²",
-                    body_style,
-                ),
-            ]
-        )
-
-    if data.get("timeline"):
-        story.append(Paragraph(f"Срок: {paragraph_text(data['timeline'])}", body_style))
-
-    story.extend(
-        [
-            Paragraph(
-                "Точная стоимость проектирования зависит от состава проекта, этажности "
-                "и конструктивных решений.",
-                body_style,
+        Paragraph("Параметры проекта", title_style),
+        Paragraph(
+            paragraph_text(
+                f"Полная стоимость проектирования: {format_rubles(data['price'])}\n"
+                f"Ставка проектирования: {format_rubles(data['price_per_m2'])}/м²\n"
+                f"Пакет: {data['package']}\n"
+                f"Стоимость пакета: {format_rubles(data['final_price'])}\n"
+                f"Ставка пакета: {format_rubles(data['package_price_per_m2'])}/м²\n"
+                f"Срок: {data['timeline']}"
             ),
-            Spacer(1, 12),
-            Paragraph("Свяжитесь со мной для разработки полноценного проекта.", body_style),
-        ]
-    )
+            body_style,
+        ),
+        Spacer(1, 8),
+        Paragraph("Пожелания по помещениям", title_style),
+        Paragraph(paragraph_text(data["rooms_summary"]), body_style),
+        Spacer(1, 12),
+        Paragraph(
+            "Анкета фиксирует базовые пожелания клиента по составу помещений и помогает "
+            "подготовить задание на проектирование.",
+            body_style,
+        ),
+    ]
 
     doc.build(story)
 
-# ===== ЛОГИКА БОТА =====
 
 def build_lead_message(user: Any, data: dict[str, Any], contact: str) -> str:
     full_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "Без имени"
     username = f"@{user.username}" if getattr(user, "username", None) else "не указан"
-    final_price = data.get("final_price")
-    total_price = data.get("price")
-    display_price = final_price if final_price is not None else total_price
-    package = data.get("package", "не выбран")
 
     return (
         "Новая заявка\n"
@@ -429,8 +367,10 @@ def build_lead_message(user: Any, data: dict[str, Any], contact: str) -> str:
         f"Площадь: {data['area']} м2\n"
         f"Этажи: {data['floors']}\n"
         f"Сложность: {data['complexity']}\n"
-        f"Пакет: {package}\n"
-        f"Стоимость проектирования: {format_rubles(display_price)}"
+        f"Пакет: {data['package']}\n"
+        f"Стоимость проектирования: {format_rubles(data['final_price'])}\n"
+        f"Срок: {data['timeline']}\n\n"
+        f"{data['rooms_summary']}"
     )
 
 
@@ -439,7 +379,7 @@ async def start(update: Any, context: Any) -> int:
         return CHOICE
 
     await update.message.reply_text(
-        "Привет. Рассчитаю стоимость проектирования и подготовлю концепцию планировки.",
+        "Привет. Рассчитаю стоимость проектирования и соберу опрос по помещениям.",
         reply_markup=ReplyKeyboardMarkup(START_KEYBOARD, resize_keyboard=True),
     )
     return CHOICE
@@ -559,8 +499,6 @@ async def package_choice(update: Any, context: Any) -> int:
         return PACKAGE
 
     area_value = context.user_data["area"]
-    floors_value = context.user_data["floors"]
-    complexity_value = context.user_data["complexity"]
     duration_multiplier = 1.2 if area_value > 150 else 1.0
     min_days = int(min_days * duration_multiplier)
     max_days = int(max_days * duration_multiplier)
@@ -578,53 +516,251 @@ async def package_choice(update: Any, context: Any) -> int:
     await update.message.reply_text(
         f"Пакет {package_name}: {format_rubles(final_price)} "
         f"({format_rubles(package_price_per_m2)}/м²)\n"
-        f"Срок: {context.user_data['timeline']}\n"
-        "Генерирую план..."
+        f"Срок: {context.user_data['timeline']}"
+    )
+    await update.message.reply_text("Теперь короткий опрос по помещениям. Сколько спален нужно?")
+    return BEDROOMS
+
+
+async def bedrooms(update: Any, context: Any) -> int:
+    if update.message is None:
+        return BEDROOMS
+
+    try:
+        bedrooms_value = parse_integer_value(update.message.text, "количество спален", minimum=1, maximum=20)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return BEDROOMS
+
+    context.user_data["bedrooms"] = bedrooms_value
+    await update.message.reply_text("Сколько санузлов нужно?")
+    return BATHROOMS
+
+
+async def bathrooms(update: Any, context: Any) -> int:
+    if update.message is None:
+        return BATHROOMS
+
+    try:
+        bathrooms_value = parse_integer_value(update.message.text, "количество санузлов", minimum=1, maximum=20)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return BATHROOMS
+
+    context.user_data["bathrooms"] = bathrooms_value
+    await update.message.reply_text(
+        "Нужна кухня-гостиная?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return KITCHEN_LIVING
+
+
+async def kitchen_living(update: Any, context: Any) -> int:
+    if update.message is None:
+        return KITCHEN_LIVING
+
+    try:
+        context.user_data["kitchen_living"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return KITCHEN_LIVING
+
+    await update.message.reply_text(
+        "Нужен кабинет?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return CABINET
+
+
+async def cabinet(update: Any, context: Any) -> int:
+    if update.message is None:
+        return CABINET
+
+    try:
+        context.user_data["cabinet"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return CABINET
+
+    await update.message.reply_text(
+        "Нужна гардеробная?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return WARDROBE
+
+
+async def wardrobe(update: Any, context: Any) -> int:
+    if update.message is None:
+        return WARDROBE
+
+    try:
+        context.user_data["wardrobe"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return WARDROBE
+
+    await update.message.reply_text(
+        "Нужны котельная или постирочная?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return UTILITY
+
+
+async def utility(update: Any, context: Any) -> int:
+    if update.message is None:
+        return UTILITY
+
+    try:
+        context.user_data["utility"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return UTILITY
+
+    await update.message.reply_text(
+        "Нужна гостевая спальня?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return GUEST_ROOM
+
+
+async def guest_room(update: Any, context: Any) -> int:
+    if update.message is None:
+        return GUEST_ROOM
+
+    try:
+        context.user_data["guest_room"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return GUEST_ROOM
+
+    await update.message.reply_text(
+        "Нужна терраса?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return TERRACE
+
+
+async def terrace(update: Any, context: Any) -> int:
+    if update.message is None:
+        return TERRACE
+
+    try:
+        context.user_data["terrace"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return TERRACE
+
+    await update.message.reply_text(
+        "Нужен гараж?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return GARAGE
+
+
+async def garage(update: Any, context: Any) -> int:
+    if update.message is None:
+        return GARAGE
+
+    try:
+        context.user_data["garage"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return GARAGE
+
+    await update.message.reply_text(
+        "Нужна сауна?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return SAUNA
+
+
+async def sauna(update: Any, context: Any) -> int:
+    if update.message is None:
+        return SAUNA
+
+    try:
+        context.user_data["sauna"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return SAUNA
+
+    await update.message.reply_text(
+        "Нужна мастер-спальня?",
+        reply_markup=ReplyKeyboardMarkup(YES_NO_KEYBOARD, resize_keyboard=True),
+    )
+    return MASTER_BEDROOM
+
+
+async def master_bedroom(update: Any, context: Any) -> int:
+    if update.message is None:
+        return MASTER_BEDROOM
+
+    try:
+        context.user_data["master_bedroom"] = parse_yes_no(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return MASTER_BEDROOM
+
+    await update.message.reply_text(
+        "Какие еще помещения нужны? Напишите через запятую или `нет`.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return EXTRA_ROOMS
+
+
+async def extra_rooms(update: Any, context: Any) -> int:
+    if update.message is None:
+        return EXTRA_ROOMS
+
+    rooms = {
+        "bedrooms": context.user_data["bedrooms"],
+        "bathrooms": context.user_data["bathrooms"],
+        "kitchen_living": context.user_data["kitchen_living"],
+        "cabinet": context.user_data["cabinet"],
+        "wardrobe": context.user_data["wardrobe"],
+        "utility": context.user_data["utility"],
+        "guest_room": context.user_data["guest_room"],
+        "terrace": context.user_data["terrace"],
+        "garage": context.user_data["garage"],
+        "sauna": context.user_data["sauna"],
+        "master_bedroom": context.user_data["master_bedroom"],
+        "extra_rooms": normalize_extra_rooms(update.message.text),
+    }
+    rooms_summary = build_rooms_summary(rooms)
+
+    context.user_data.update(
+        {
+            "rooms": rooms,
+            "rooms_summary": rooms_summary,
+        }
     )
 
-    settings: Settings = context.application.bot_data["settings"]
-    client = context.application.bot_data["openai_client"]
+    brief_data = {
+        "package": context.user_data["package"],
+        "final_price": context.user_data["final_price"],
+        "package_price_per_m2": context.user_data["package_price_per_m2"],
+        "timeline": context.user_data["timeline"],
+        "rooms_summary": rooms_summary,
+    }
 
-    try:
-        text_plan = generate_plan_text(client, settings, area_value, floors_value, complexity_value)
-    except Exception:
-        LOGGER.exception("Ошибка генерации текстовой концепции")
-        text_plan = (
-            "Не удалось получить текстовую концепцию от OpenAI. "
-            "Проверьте API-ключ и доступность модели."
-        )
-
-    image_bytes: bytes | None = None
-    try:
-        image_bytes = generate_plan_image(client, settings, area_value, floors_value)
-    except Exception:
-        LOGGER.exception("Ошибка генерации изображения")
-
-    context.user_data["plan_text"] = text_plan
-
-    if image_bytes:
-        image_stream = BytesIO(image_bytes)
-        image_stream.name = "plan.png"
-        await update.message.reply_photo(photo=image_stream)
-
-    await update.message.reply_text(text_plan[:3500] or "Описание планировки пустое.")
+    await update.message.reply_text(build_brief_summary(brief_data))
 
     pdf_path = BASE_DIR / f"offer_{update.effective_user.id}.pdf"
     pdf_data = {
-        "area": area_value,
-        "floors": floors_value,
-        "complexity": complexity_value,
+        "area": context.user_data["area"],
+        "floors": context.user_data["floors"],
+        "complexity": context.user_data["complexity"],
         "price": context.user_data["price"],
         "price_per_m2": context.user_data["price_per_m2"],
-        "final_price": final_price,
-        "package_price_per_m2": package_price_per_m2,
-        "package": package_name,
+        "final_price": context.user_data["final_price"],
+        "package_price_per_m2": context.user_data["package_price_per_m2"],
+        "package": context.user_data["package"],
         "timeline": context.user_data["timeline"],
-        "plan_text": text_plan,
+        "rooms_summary": rooms_summary,
     }
 
     try:
-        create_pdf(pdf_data, image_bytes, pdf_path)
+        create_pdf(pdf_data, pdf_path)
         with pdf_path.open("rb") as pdf_file:
             await update.message.reply_document(document=pdf_file, filename="offer.pdf")
     except Exception:
@@ -649,9 +785,10 @@ async def contact(update: Any, context: Any) -> int:
         "area": context.user_data.get("area"),
         "floors": context.user_data.get("floors"),
         "complexity": context.user_data.get("complexity"),
-        "price": context.user_data.get("price"),
         "final_price": context.user_data.get("final_price"),
         "package": context.user_data.get("package"),
+        "timeline": context.user_data.get("timeline"),
+        "rooms_summary": context.user_data.get("rooms_summary"),
     }
 
     lead_message = build_lead_message(update.effective_user, lead_data, contact_value)
@@ -673,7 +810,7 @@ async def cancel(update: Any, context: Any) -> int:
     context.user_data.clear()
 
     if update.message is not None:
-        await update.message.reply_text("Диалог отменён.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Диалог отменен.", reply_markup=ReplyKeyboardRemove())
 
     return ConversationHandler.END
 
@@ -689,7 +826,6 @@ def build_application(settings: Settings) -> Any:
 
     application = ApplicationBuilder().token(settings.telegram_token).build()
     application.bot_data["settings"] = settings
-    application.bot_data["openai_client"] = OpenAI(api_key=settings.openai_api_key)
 
     conversation_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -699,6 +835,18 @@ def build_application(settings: Settings) -> Any:
             FLOORS: [MessageHandler(filters.TEXT & ~filters.COMMAND, floors)],
             COMPLEXITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, complexity)],
             PACKAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, package_choice)],
+            BEDROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bedrooms)],
+            BATHROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bathrooms)],
+            KITCHEN_LIVING: [MessageHandler(filters.TEXT & ~filters.COMMAND, kitchen_living)],
+            CABINET: [MessageHandler(filters.TEXT & ~filters.COMMAND, cabinet)],
+            WARDROBE: [MessageHandler(filters.TEXT & ~filters.COMMAND, wardrobe)],
+            UTILITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, utility)],
+            GUEST_ROOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, guest_room)],
+            TERRACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, terrace)],
+            GARAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, garage)],
+            SAUNA: [MessageHandler(filters.TEXT & ~filters.COMMAND, sauna)],
+            MASTER_BEDROOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, master_bedroom)],
+            EXTRA_ROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, extra_rooms)],
             CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
