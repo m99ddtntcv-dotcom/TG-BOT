@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import re
@@ -10,6 +11,7 @@ from xml.sax.saxutils import escape
 
 try:
     from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
+    from telegram.error import Conflict as TelegramConflictError
     from telegram.ext import (
         ApplicationBuilder,
         CommandHandler,
@@ -24,6 +26,7 @@ except ImportError:
     MessageHandler = None
     ReplyKeyboardMarkup = None
     ReplyKeyboardRemove = None
+    TelegramConflictError = None
     filters = None
 
 try:
@@ -54,6 +57,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
+LOCK_FILE = BASE_DIR / ".bot.lock"
 (
     CHOICE,
     AREA,
@@ -74,6 +78,8 @@ BASE_DIR = Path(__file__).resolve().parent
     EXTRA_ROOMS,
     CONTACT,
 ) = range(18)
+
+RUN_LOCK_HANDLE: Any = None
 
 START_KEYBOARD = [["🏠 Рассчитать дом"]]
 PACKAGE_KEYBOARD = [["🟢 Эскиз", "🔵 Проект"], ["🟡 Премиум"]]
@@ -139,6 +145,24 @@ def load_settings() -> Settings:
         telegram_token=telegram_token,
         admin_chat_id=admin_chat_id,
     )
+
+
+def acquire_instance_lock() -> None:
+    global RUN_LOCK_HANDLE
+
+    lock_handle = LOCK_FILE.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        lock_handle.close()
+        raise RuntimeError(
+            "Бот уже запущен в другом локальном процессе. "
+            "Остановите предыдущий запуск и попробуйте снова."
+        ) from exc
+
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+    RUN_LOCK_HANDLE = lock_handle
 
 
 def find_pdf_font() -> str:
@@ -868,13 +892,25 @@ def main() -> int:
             )
 
         settings = load_settings()
+        acquire_instance_lock()
         application = build_application(settings)
     except RuntimeError as exc:
         print(f"Ошибка запуска: {exc}")
         return 1
 
     print("Бот запущен...")
-    application.run_polling()
+    try:
+        application.run_polling()
+    except Exception as exc:
+        if TelegramConflictError is not None and isinstance(exc, TelegramConflictError):
+            print(
+                "Ошибка запуска: этот токен уже используется другим экземпляром бота "
+                "через getUpdates. Остановите второй запуск бота "
+                "(например локальный процесс, Render worker или другой сервер) "
+                "и попробуйте снова."
+            )
+            return 1
+        raise
     return 0
 
 
