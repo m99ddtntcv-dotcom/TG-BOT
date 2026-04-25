@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -123,8 +124,6 @@ def load_settings() -> Settings:
     telegram_token, telegram_token_key = get_first_env(
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_TOKEN",
-        "BOT_TOKEN",
-        "TOKEN",
     )
     openai_api_key, openai_api_key_name = get_first_env(
         "OPENAI_API_KEY",
@@ -135,8 +134,8 @@ def load_settings() -> Settings:
     if not telegram_token:
         raise RuntimeError(
             "Не задан токен Telegram. Ожидается переменная окружения "
-            "`TELEGRAM_BOT_TOKEN` (поддерживаются также `TELEGRAM_TOKEN`, "
-            "`BOT_TOKEN`, `TOKEN`). На Render добавьте её в Service -> Environment "
+            "`TELEGRAM_BOT_TOKEN` (поддерживается также `TELEGRAM_TOKEN`). "
+            "На Render добавьте её в Service -> Environment "
             "и выполните redeploy."
         )
 
@@ -490,7 +489,14 @@ async def complexity(update: Any, context: Any) -> int:
     client = context.application.bot_data["openai_client"]
 
     try:
-        text_plan = generate_plan_text(client, settings, area_value, floors_value, complexity_value)
+        text_plan = await asyncio.to_thread(
+            generate_plan_text,
+            client,
+            settings,
+            area_value,
+            floors_value,
+            complexity_value,
+        )
     except Exception:
         LOGGER.exception("Ошибка генерации текстовой концепции")
         text_plan = (
@@ -500,7 +506,13 @@ async def complexity(update: Any, context: Any) -> int:
 
     image_bytes: bytes | None = None
     try:
-        image_bytes = generate_plan_image(client, settings, area_value, floors_value)
+        image_bytes = await asyncio.to_thread(
+            generate_plan_image,
+            client,
+            settings,
+            area_value,
+            floors_value,
+        )
     except Exception:
         LOGGER.exception("Ошибка генерации изображения")
 
@@ -523,7 +535,7 @@ async def complexity(update: Any, context: Any) -> int:
     }
 
     try:
-        create_pdf(pdf_data, image_bytes, pdf_path)
+        await asyncio.to_thread(create_pdf, pdf_data, image_bytes, pdf_path)
         with pdf_path.open("rb") as pdf_file:
             await update.message.reply_document(document=pdf_file, filename="offer.pdf")
     except Exception:
@@ -553,9 +565,15 @@ async def contact(update: Any, context: Any) -> int:
 
     lead_message = build_lead_message(update.effective_user, lead_data, contact_value)
 
+    reply_text = "Спасибо. Контакт получен, но отправка администратору не настроена."
     if settings.admin_chat_id is not None:
-        await context.bot.send_message(chat_id=settings.admin_chat_id, text=lead_message)
-        reply_text = "Спасибо. Заявка отправлена."
+        try:
+            await context.bot.send_message(chat_id=settings.admin_chat_id, text=lead_message)
+            reply_text = "Спасибо. Заявка отправлена."
+        except Exception:
+            LOGGER.exception("Не удалось отправить заявку администратору")
+            LOGGER.info("Лид для ручной обработки:\n%s", lead_message)
+            reply_text = "Спасибо. Контакт получен, но отправка администратору не удалась."
     else:
         LOGGER.warning("ADMIN_CHAT_ID не задан. Заявка не была отправлена администратору.")
         LOGGER.info(lead_message)
